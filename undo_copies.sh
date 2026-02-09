@@ -33,3 +33,5 @@ rm -f -- "timestamped/cymatics.fm/Cymatics - 9God Hip Hop Sample Pack/Drums - Lo
 rm -f -- "timestamped/cymatics.fm/Cymatics - 9God Hip Hop Sample Pack/Drums - Loops/Full Drum Loops/20241001__Cymatics - 9God Full Drum Loop 5 - 150 BPM.wav"
 rm -f -- "timestamped/cymatics.fm/Cymatics - 9God Hip Hop Sample Pack/Drums - Loops/Full Drum Loops/20241001__Cymatics - 9God Full Drum Loop 6 - 160 BPM.wav"
 rm -f -- "timestamped/cymatics.fm/Cymatics - 9God Hip Hop Sample Pack/Drums - Loops/Full Drum Loops/20241001__Cymatics - 9God Full Drum Loop 7 - 160 BPM.wav"
+rm -f -- "timestamped/cymatics.fm/Cymatics - 9God Hip Hop Sample Pack/Drums - Loops/Full Drum Loops/20241001__Cymatics - 9God Full Drum Loop 8 - 175 BPM.wav"
+rm -f -- "timestamped/cymatics.fm/Cymatics - 9God Hip Hop Sample Pack/Drums - Loops/Hihat Loops/20241001__Cymatics - 9God Hihat Loop 1 - 100 BPM.wav"
