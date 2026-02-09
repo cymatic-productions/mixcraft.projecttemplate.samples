@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# categorize_audio_by_git_date_copy.sh (verbose, date format YYYYMMDD, COPY into timestamped/ tree, Ctrl+C friendly)
+# categorize_audio_by_git_date_copy.sh (verbose, YYYYMMDD, COPY into timestamped/, Ctrl+C friendly, precheck target before git, process smallest files first)
 # Git-Bash (Windows 11) compatible.
 #
-# This script COPIES each tracked .wav/.mp3 file (anywhere in repo) to a mirrored path under `timestamped/`,
+# Copies tracked .wav/.mp3 files (anywhere in repo) to a mirrored path under `timestamped/`,
 # prefixing the basename with the date it was first added to git:
 #
 #   <orig/path/file.ext>
@@ -12,31 +12,17 @@
 #   algorhythms/01242025_1.plucks 120bpm.wav
 #     -> timestamped/algorhythms/20250130__01242025_1.plucks 120bpm.wav
 #
-# Key optimization requested:
-# - BEFORE doing any `git log` / `git show` work, the script first checks whether either of the two possible
-#   target names ALREADY exists:
-#     1) timestamped/<dir>/<UNKNOWNDATE>__<stem><ext> (can't check because date unknown)
-#     2) BUT we *can* check idempotently AFTER we know date.
-#
-# Since you requested "check target exists before any git log", the script instead checks for a cheap sentinel:
-# - If there is ANY existing timestamped copy for that source file in the corresponding destination directory,
-#   we SKIP git history lookups for that file.
-#
-# Concretely:
-# - For source file `a/b/foo.wav`, we look in `timestamped/a/b/` for:
-#     * `????????__foo.wav` (8 digits + "__" + original base), OR
-#     * `????????__foo__???????.wav` (hashed variant)
-#   If either exists, we skip the file WITHOUT calling `git log`.
-#
-# Behavior:
+# Key behaviors:
 # - Original files remain untouched.
 # - Date prefix is YYYYMMDD (no dashes).
 # - Skips source files whose basename already starts with YYYYMMDD__ (avoids double-prefixing).
 # - Skips files inside timestamped/ (prevents recursion/dup).
-# - Copy collision policy after date is known:
-#     1) If primary dest exists, try __<shortsha>
-#     2) If __<shortsha> also exists, SKIP (no __2/__3 suffixing)
+# - Precheck BEFORE ANY git calls: if any prior timestamped copy exists for this source in the dest folder, skip.
+# - Collision policy after date is known:
+#     1) If primary dest exists/planned, try __<shortsha>
+#     2) If hash dest exists/planned, SKIP (no __2/__3)
 # - Trims characters from END of stem to keep basename bounded (Windows-friendly).
+# - Processes files in ascending size order (smallest first).
 # - Ctrl+C (SIGINT) exits quickly with exit code 130.
 #
 # Dry-run is default. Use --apply to actually copy.
@@ -48,11 +34,7 @@ set -o pipefail
 MODE="dry-run"
 VERBOSE=1
 
-# Destination root
 DEST_ROOT="timestamped"
-
-# Max length of the filename *without extension* after applying prefix/collision suffix.
-# Extension like .wav/.mp3 is not counted in this limit.
 MAX_BASENAME_LEN=120
 
 MAP_CSV="audio_copy_map.csv"
@@ -89,7 +71,6 @@ log() {
     echo "[LOG] $*"
   fi
 }
-
 warn() { echo "[WARN] $*" >&2; }
 err()  { echo "[ERR]  $*" >&2; }
 
@@ -105,7 +86,7 @@ cd "$REPO_ROOT" || { err "Failed to cd to repo root: $REPO_ROOT"; exit 1; }
 log "Mode: $MODE"
 log "Repo root: $REPO_ROOT"
 log "Destination root: $DEST_ROOT/"
-log "Scanning entire repo recursively for .wav/.mp3 ..."
+log "Scanning entire repo recursively for .wav/.mp3 (smallest first) ..."
 
 # Initialize outputs
 echo "old_path,new_path,date,commit_sha,status" > "$MAP_CSV"
@@ -143,17 +124,14 @@ is_audio_file() {
   return $rc
 }
 
-# Match YYYYMMDD__ (8 digits, no dashes)
 already_prefixed() {
   [[ "$1" =~ ^[0-9]{8}__ ]]
 }
 
-# Convert YYYY-MM-DD -> YYYYMMDD
 compact_date() {
   echo "${1//-/}"
 }
 
-# Trim a string from the END by limiting its max length (keeps the front)
 trim_stem() {
   local stem="$1"
   local maxlen="$2"
@@ -164,28 +142,21 @@ trim_stem() {
   fi
 }
 
-# Build a "precheck" glob pattern that matches any timestamped copy for the given source file
-# without knowing the date/sha yet.
-#
-# For src `a/b/foo.wav`, we check if either exists:
-#   timestamped/a/b/????????__foo.wav
-#   timestamped/a/b/????????__foo__???????.wav   (exactly 7 chars before ext)
-#
-# Returns 0 (true) if a match exists, else 1.
+# Precheck for any prior timestamped copy without git history lookups.
+# Looks for:
+#   timestamped/<dir>/????????__<trimmedStem><ext>
+#   timestamped/<dir>/????????__<trimmedStem>__???????<ext>
 precheck_any_existing_copy() {
   local src_rel="$1"
-  local src_dir
-  local src_base
+  local src_dir src_base
   src_dir="$(dirname "$src_rel")"
   src_base="$(basename "$src_rel")"
 
   local dest_dir="${DEST_ROOT}/${src_dir}"
   dest_dir="${dest_dir#./}"
 
-  # If destination directory doesn't exist, there can't be a prior copy
   [[ -d "$dest_dir" ]] || return 1
 
-  # Separate ext and stem
   local ext=""
   if [[ "$src_base" == *.* ]]; then
     ext=".${src_base##*.}"
@@ -193,7 +164,7 @@ precheck_any_existing_copy() {
   local stem="$src_base"
   [[ -n "$ext" ]] && stem="${src_base%$ext}"
 
-  # Apply same trimming policy so patterns align with generated names
+  # Apply the same trimming policy
   local prefix_len=8
   prefix_len=$((prefix_len + 2))     # "__"
   local reserved_collision=9         # "__" + 7
@@ -204,35 +175,24 @@ precheck_any_existing_copy() {
   local p1="${dest_dir}/????????__${stem}${ext}"
   local p2="${dest_dir}/????????__${stem}__???????${ext}"
 
-  # Use compgen to test globs without printing
-  if compgen -G "$p1" >/dev/null; then
-    return 0
-  fi
-  if compgen -G "$p2" >/dev/null; then
-    return 0
-  fi
-
+  compgen -G "$p1" >/dev/null && return 0
+  compgen -G "$p2" >/dev/null && return 0
   return 1
 }
 
-# Compute destination path AFTER we know date/sha:
-#   src:  some/dir/file.wav
-#   dst:  timestamped/some/dir/YYYYMMDD__file.wav
-#
+# After date is known, compute a concrete destination.
 # Collision policy:
-#   - If primary destination exists/planned, try __<shortsha>
-#   - If hash destination exists/planned, return a SKIP marker
+#   - if primary exists/planned, try __shortsha
+#   - if hash exists/planned, SKIP
 make_dest_path() {
-  local src_rel="$1"     # repo-relative, no leading ./
-  local date="$2"        # YYYYMMDD
-  local shortsha="$3"    # 7 chars
+  local src_rel="$1"
+  local date="$2"
+  local shortsha="$3"
 
-  local src_dir
-  local src_base
+  local src_dir src_base
   src_dir="$(dirname "$src_rel")"
   src_base="$(basename "$src_rel")"
 
-  # Split ext and stem
   local ext=""
   if [[ "$src_base" == *.* ]]; then
     ext=".${src_base##*.}"
@@ -240,10 +200,9 @@ make_dest_path() {
   local stem="$src_base"
   [[ -n "$ext" ]] && stem="${src_base%$ext}"
 
-  # Enforce bounded basename (without ext)
   local prefix_len=${#date}
-  prefix_len=$((prefix_len + 2))     # "__"
-  local reserved_collision=9         # "__" + 7
+  prefix_len=$((prefix_len + 2))
+  local reserved_collision=9
   local allowed_stem_len=$((MAX_BASENAME_LEN - prefix_len - reserved_collision))
   (( allowed_stem_len < 10 )) && allowed_stem_len=10
 
@@ -258,12 +217,10 @@ make_dest_path() {
 
   local candidate="${dest_dir}/${date}__${stem}${ext}"
 
-  # If primary exists/planned, try hash variant
   if [[ -e "$candidate" || -n "${planned_targets["$candidate"]+x}" ]]; then
     log "Collision detected for dest: $candidate"
     candidate="${dest_dir}/${date}__${stem}__${shortsha}${ext}"
 
-    # If even hash variant exists/planned, SKIP
     if [[ -e "$candidate" || -n "${planned_targets["$candidate"]+x}" ]]; then
       echo "__SKIP_ALREADY_EXISTS__:$candidate"
       return
@@ -273,40 +230,81 @@ make_dest_path() {
   echo "$candidate"
 }
 
-# Ensure destination root exists (apply mode); in dry-run we don't create anything
+# Ensure destination root exists (apply mode)
 if [[ "$MODE" == "apply" ]]; then
   mkdir -p "$DEST_ROOT" || { err "Failed to create $DEST_ROOT/"; exit 1; }
 fi
 
-# MAIN LOOP
-while IFS= read -r -d '' f; do
-  # Respect Ctrl+C quickly even inside the loop
+# --- Build a sorted (by size) list of candidate files, then process it ---
+# We generate NUL-delimited list with find, then use git-bash's `stat -c%s` to get size.
+# Output format: "<size>\t<path>\0" then sort numeric and iterate.
+log "Building size-sorted file list (this may take a moment)..."
+
+sorted_list_file="$(mktemp -t audio_sorted_list.XXXXXX)"
+cleanup() { rm -f "$sorted_list_file" 2>/dev/null || true; }
+trap 'cleanup; exit 130' INT
+
+# Create list
+# Note: stat -c%s is available in Git Bash coreutils.
+while IFS= read -r -d '' p; do
+  p="${p#./}"
+
+  # Skip anything inside DEST_ROOT early to reduce work
+  if [[ "$p" == "$DEST_ROOT/"* ]]; then
+    continue
+  fi
+
+  if ! is_audio_file "$p"; then
+    continue
+  fi
+
+  # If stat fails, treat size as large
+  sz="$(stat -c%s -- "$p" 2>/dev/null || echo 999999999999)"
+  printf '%s\t%s\0' "$sz" "$p" >> "$sorted_list_file"
+done < <(find . -type f -print0)
+
+# Sort by size (numeric) while preserving NUL delimiters by translating to newlines for sort,
+# then back to NUL. Safe enough because file paths from Git Bash typically don't contain newlines.
+sorted_stream="$(mktemp -t audio_sorted_stream.XXXXXX)"
+# shellcheck disable=SC2064
+trap "cleanup; rm -f '$sorted_stream' 2>/dev/null || true; exit 130" INT
+
+python - <<'PY' "$sorted_list_file" "$sorted_stream"
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read().split(b"\0")
+rows = [r for r in data if r]
+rows.sort(key=lambda r: int(r.split(b"\t",1)[0]))
+with open(dst, "wb") as f:
+    for r in rows:
+        f.write(r + b"\0")
+PY
+
+rm -f "$sorted_list_file" 2>/dev/null || true
+sorted_list_file="$sorted_stream"
+
+log "Processing sorted files..."
+
+# MAIN LOOP over sorted list
+while IFS= read -r -d '' rec; do
   if (( INTERRUPTED )); then
     err "Interrupted flag set; exiting loop."
+    cleanup
     exit 130
   fi
 
-  f="${f#./}"
+  # record format: "<size>\t<path>"
+  size="${rec%%$'\t'*}"
+  f="${rec#*$'\t'}"
 
-  # Avoid copying files that are already inside DEST_ROOT (prevents recursion/dup)
-  if [[ "$f" == "$DEST_ROOT/"* ]]; then
-    skipped_in_dest_root=$((skipped_in_dest_root+1))
-    continue
-  fi
+  # Safety: ignore empties
+  [[ -n "$f" ]] || continue
 
-  if ! is_audio_file "$f"; then
-    non_audio_seen=$((non_audio_seen+1))
-    continue
-  fi
-
-  total_scanned=$((total_scanned+1))
-
+  # Maintain some counters for visibility
   base="$(basename "$f")"
-  dir="$(dirname "$f")"
 
   log "----"
-  log "[$total_scanned] Audio file: $f"
-  log "dir=$dir base=$base"
+  log "Audio file: $f (size=${size} bytes)"
 
   if already_prefixed "$base"; then
     skipped_prefixed=$((skipped_prefixed+1))
@@ -315,8 +313,7 @@ while IFS= read -r -d '' f; do
     continue
   fi
 
-  # NEW: Precheck if any timestamped copy already exists for this file (base or hashed)
-  # This happens BEFORE ANY git calls.
+  # Precheck BEFORE ANY git calls
   log "Precheck: looking for existing timestamped copy without git history..."
   if precheck_any_existing_copy "$f"; then
     skipped_precheck_exists=$((skipped_precheck_exists+1))
@@ -325,10 +322,10 @@ while IFS= read -r -d '' f; do
     continue
   fi
 
-  # Git history lookups only happen if precheck didn't find an existing copy
+  total_scanned=$((total_scanned+1))
+
   log "Running: git log --diff-filter=A --follow --format=%H -- \"$f\""
   sha="$(git log --diff-filter=A --follow --format=%H -- "$f" 2>/dev/null | tail -n 1 || true)"
-
   if [[ -z "$sha" ]]; then
     no_add_commit=$((no_add_commit+1))
     warn "NO_ADD_COMMIT for: $f"
@@ -339,7 +336,6 @@ while IFS= read -r -d '' f; do
   log "Add-commit SHA: $sha"
   log "Running: git show -s --format=%ad --date=short \"$sha\""
   date_added_dashed="$(git show -s --format=%ad --date=short "$sha" 2>/dev/null || true)"
-
   if [[ -z "$date_added_dashed" ]]; then
     apply_err=$((apply_err+1))
     err "ERROR_NO_DATE for sha=$sha file=$f"
@@ -352,7 +348,6 @@ while IFS= read -r -d '' f; do
   log "Date added: $date_added_dashed -> compact: $date_added (shortsha=$shortsha)"
 
   dest_path="$(make_dest_path "$f" "$date_added" "$shortsha")"
-
   if [[ "$dest_path" == __SKIP_ALREADY_EXISTS__:* ]]; then
     skipped_already_exists=$((skipped_already_exists+1))
     actual_path="${dest_path#__SKIP_ALREADY_EXISTS__:}"
@@ -377,7 +372,6 @@ while IFS= read -r -d '' f; do
     printf '%s,%s,%s,%s,%s\n' "\"$f\"" "\"$dest_path\"" "\"$date_added\"" "\"$sha\"" "PLANNED" >> "$MAP_CSV"
     echo "rm -f -- \"$dest_path\"" >> "$UNDO_SH"
   else
-    # Ensure destination directory exists
     dest_dir="$(dirname "$dest_path")"
     log "Ensuring destination dir exists: $dest_dir"
     if ! mkdir -p "$dest_dir"; then
@@ -401,20 +395,30 @@ while IFS= read -r -d '' f; do
     fi
   fi
 
-  (( total_scanned % 100 == 0 )) && log "Progress: processed $total_scanned audio files"
+  (( total_scanned % 100 == 0 )) && log "Progress: processed $total_scanned audio files (git-evaluated)"
 
-done < <(find . -type f -print0)
+done < <(python - <<'PY' "$sorted_list_file"
+import sys
+data = open(sys.argv[1], "rb").read().split(b"\0")
+for r in data:
+    if r:
+        sys.stdout.buffer.write(r + b"\0")
+PY
+)
+
+cleanup
+rm -f "$sorted_list_file" 2>/dev/null || true
 
 log "----"
-log "Finished scanning."
+log "Finished processing."
 
 echo ""
 echo "Summary:"
-echo "  Total audio files processed:   $total_scanned"
+echo "  Git-evaluated audio files:     $total_scanned"
 echo "  Skipped (already prefixed):    $skipped_prefixed"
-echo "  Skipped (inside $DEST_ROOT/):  $skipped_in_dest_root"
 echo "  Skipped (precheck exists):     $skipped_precheck_exists"
 echo "  Skipped (already exists):      $skipped_already_exists"
+echo "  Skipped (inside $DEST_ROOT/):  $skipped_in_dest_root"
 echo "  No add-commit found:           $no_add_commit"
 echo "  Planned copies:                $planned_copies"
 if [[ "$MODE" == "apply" ]]; then
