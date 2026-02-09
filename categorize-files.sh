@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# categorize_audio_by_git_date_copy.sh (verbose, date format YYYYMMDD, COPY into timestamped/ tree)
+# categorize_audio_by_git_date_copy.sh (verbose, date format YYYYMMDD, COPY into timestamped/ tree, Ctrl+C friendly, skip on collision)
 # Git-Bash (Windows 11) compatible.
 #
-# Instead of renaming/moving files, this script COPIES each tracked .wav/.mp3 file
-# to a mirrored path under `timestamped/`, with a date prefix based on the file's
-# first-add commit date in git:
+# This script COPIES each tracked .wav/.mp3 file (anywhere in repo) to a mirrored path under `timestamped/`,
+# prefixing the basename with the date it was first added to git:
 #
 #   <orig/path/file.ext>
 #     -> timestamped/<orig/path/YYYYMMDD__file.ext>
@@ -13,12 +12,16 @@
 #   algorhythms/01242025_1.plucks 120bpm.wav
 #     -> timestamped/algorhythms/20250130__01242025_1.plucks 120bpm.wav
 #
-# Notes:
+# Behavior:
 # - Original files remain untouched.
 # - Date prefix is YYYYMMDD (no dashes).
-# - Skips files already prefixed with YYYYMMDD__ (to avoid double-prefixing).
-# - Collision handling: appends __<shortsha> (and numeric suffix if needed).
+# - Skips source files whose basename already starts with YYYYMMDD__ (avoids double-prefixing).
+# - Skips files inside timestamped/ (prevents recursion/dup).
+# - Collision policy (idempotent-ish):
+#     1) If primary dest exists, try __<shortsha>
+#     2) If __<shortsha> also exists, SKIP (no __2/__3 suffixing)
 # - Trims characters from END of stem to keep basename bounded (Windows-friendly).
+# - Ctrl+C (SIGINT) exits quickly with exit code 130.
 #
 # Dry-run is default. Use --apply to actually copy.
 # Verbose logging is ON by default. Use --quiet to reduce logs.
@@ -36,6 +39,21 @@ DEST_ROOT="timestamped"
 # Extension like .wav/.mp3 is not counted in this limit.
 MAX_BASENAME_LEN=120
 
+MAP_CSV="audio_copy_map.csv"
+UNDO_SH="undo_copies.sh"
+
+# Interrupt handling (Ctrl+C)
+INTERRUPTED=0
+trap '
+  INTERRUPTED=1
+  echo ""
+  echo "[INTERRUPT] Ctrl+C received. Exiting safely..."
+  echo "[INTERRUPT] Partial outputs (so far):"
+  echo "  - ${MAP_CSV:-audio_copy_map.csv}"
+  echo "  - ${UNDO_SH:-undo_copies.sh}"
+  exit 130
+' INT
+
 usage() {
   echo "Usage: $0 [--dry-run|--apply] [--quiet]"
   exit 2
@@ -49,9 +67,6 @@ for arg in "$@"; do
     *) usage ;;
   esac
 done
-
-MAP_CSV="audio_copy_map.csv"
-UNDO_SH="undo_copies.sh"
 
 log() {
   if [[ "${VERBOSE:-1}" -eq 1 ]]; then
@@ -94,6 +109,7 @@ declare -A date_counts=()
 total_scanned=0
 skipped_prefixed=0
 skipped_in_dest_root=0
+skipped_already_exists=0
 no_add_commit=0
 planned_copies=0
 apply_ok=0
@@ -133,7 +149,11 @@ trim_stem() {
 
 # Compute destination path:
 #   src:  some/dir/file.wav
-#   dst:  timestamped/some/dir/YYYYMMDD__file.wav   (possibly with __shortsha, etc.)
+#   dst:  timestamped/some/dir/YYYYMMDD__file.wav
+#
+# Collision policy:
+#   - If primary destination exists, try __<shortsha>
+#   - If hash destination exists, return a SKIP marker
 make_dest_path() {
   local src_rel="$1"     # repo-relative, no leading ./
   local date="$2"        # YYYYMMDD
@@ -159,7 +179,7 @@ make_dest_path() {
   #   <date>__<stem>__<shortsha>
   local prefix_len=${#date}
   prefix_len=$((prefix_len + 2))     # "__"
-  local reserved_collision=9          # "__" + 7
+  local reserved_collision=9         # "__" + 7
   local allowed_stem_len=$((MAX_BASENAME_LEN - prefix_len - reserved_collision))
   (( allowed_stem_len < 10 )) && allowed_stem_len=10
 
@@ -172,25 +192,19 @@ make_dest_path() {
   # Candidate destination (mirrored path under DEST_ROOT)
   local dest_dir="${DEST_ROOT}/${src_dir}"
   dest_dir="${dest_dir#./}"
+
   local candidate="${dest_dir}/${date}__${stem}${ext}"
 
-  # Collision handling against actual FS + planned targets
+  # If primary exists or was already planned, try hash variant
   if [[ -e "$candidate" || -n "${planned_targets["$candidate"]+x}" ]]; then
     log "Collision detected for dest: $candidate"
     candidate="${dest_dir}/${date}__${stem}__${shortsha}${ext}"
-  fi
 
-  if [[ -e "$candidate" || -n "${planned_targets["$candidate"]+x}" ]]; then
-    log "Collision persists; adding numeric suffix for dest: $candidate"
-    local n=2
-    while :; do
-      local alt="${dest_dir}/${date}__${stem}__${shortsha}__${n}${ext}"
-      if [[ ! -e "$alt" && -z "${planned_targets["$alt"]+x}" ]]; then
-        candidate="$alt"
-        break
-      fi
-      n=$((n+1))
-    done
+    # If even hash variant exists/planned, SKIP
+    if [[ -e "$candidate" || -n "${planned_targets["$candidate"]+x}" ]]; then
+      echo "__SKIP_ALREADY_EXISTS__:$candidate"
+      return
+    fi
   fi
 
   echo "$candidate"
@@ -203,6 +217,12 @@ fi
 
 # MAIN LOOP
 while IFS= read -r -d '' f; do
+  # Respect Ctrl+C quickly even inside the loop
+  if (( INTERRUPTED )); then
+    err "Interrupted flag set; exiting loop."
+    exit 130
+  fi
+
   f="${f#./}"
 
   # Avoid copying files that are already inside DEST_ROOT (prevents recursion/dup)
@@ -258,6 +278,16 @@ while IFS= read -r -d '' f; do
   log "Date added: $date_added_dashed -> compact: $date_added (shortsha=$shortsha)"
 
   dest_path="$(make_dest_path "$f" "$date_added" "$shortsha")"
+
+  if [[ "$dest_path" == __SKIP_ALREADY_EXISTS__:* ]]; then
+    skipped_already_exists=$((skipped_already_exists+1))
+    actual_path="${dest_path#__SKIP_ALREADY_EXISTS__:}"
+    log "SKIP already exists (base + hash): $actual_path"
+    printf '%s,%s,%s,%s,%s\n' \
+      "\"$f\"" "\"$actual_path\"" "\"$date_added\"" "\"$sha\"" "SKIP_ALREADY_EXISTS" >> "$MAP_CSV"
+    continue
+  fi
+
   log "Destination: $dest_path"
 
   planned_targets["$dest_path"]=1
@@ -309,6 +339,7 @@ echo "Summary:"
 echo "  Total audio files processed:  $total_scanned"
 echo "  Skipped (already prefixed):   $skipped_prefixed"
 echo "  Skipped (inside $DEST_ROOT/): $skipped_in_dest_root"
+echo "  Skipped (already exists):     $skipped_already_exists"
 echo "  No add-commit found:          $no_add_commit"
 echo "  Planned copies:               $planned_copies"
 if [[ "$MODE" == "apply" ]]; then
